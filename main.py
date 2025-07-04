@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 import tempfile
 import uuid
 from document_processor import DocumentProcessor
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 # Load environment variables
 load_dotenv()
@@ -88,11 +90,9 @@ def get_relevant_context(transcription):
         return ""
 
 def analyze_with_openai(transcription):
-    """Analyze transcription using OpenAI GPT-4 with RAG context"""
+    """Analyze transcription using OpenAI GPT-4 with RAG context via LangChain"""
     try:
-        # Get relevant context from knowledge base
         context = get_relevant_context(transcription)
-        
         prompt = f"""
         You are a medical professional analyzing a conversation between a patient and physician. 
         Please provide a structured medical report with the following sections:
@@ -102,7 +102,7 @@ def analyze_with_openai(transcription):
 
         {context}
 
-        Please analyze this conversation and provide:
+        Please analyze this conversation and provide a structured response with clear section headers:
 
         1. HISTORY OF PRESENT ILLNESS (HPI):
         - Chief complaint
@@ -120,20 +120,24 @@ def analyze_with_openai(transcription):
         Use the knowledge base information to enhance your analysis with relevant medical guidelines, 
         protocols, or best practices that apply to this case.
 
-        Format the response as a professional medical document.
+        IMPORTANT: Format your response exactly as follows:
+        Start with \"1. HISTORY OF PRESENT ILLNESS (HPI):\" on its own line
+        Then provide the HPI content
+        Then start a new section with \"2. ASSESSMENT AND PLAN:\" on its own line
+        Then provide the assessment and plan content
         """
-        
-        response = openai.ChatCompletion.create(
+        llm = ChatOpenAI(
             model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are a medical professional assistant. Provide accurate, professional medical analysis using available knowledge base information."},
-                {"role": "user", "content": prompt}
-            ],
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            temperature=0.3,
             max_tokens=2000,
-            temperature=0.3
         )
-        
-        return response.choices[0].message.content
+        messages = [
+            SystemMessage(content="You are a medical professional assistant. Provide accurate, professional medical analysis using available knowledge base information."),
+            HumanMessage(content=prompt)
+        ]
+        response = llm.invoke(messages)
+        return response.content
     except Exception as e:
         return f"Error analyzing with OpenAI: {str(e)}"
 
@@ -154,7 +158,7 @@ def analyze_with_gemini(transcription):
 
         {context}
 
-        Please analyze this conversation and provide:
+        Please analyze this conversation and provide a structured response with clear section headers:
 
         1. HISTORY OF PRESENT ILLNESS (HPI):
         - Chief complaint
@@ -172,7 +176,11 @@ def analyze_with_gemini(transcription):
         Use the knowledge base information to enhance your analysis with relevant medical guidelines, 
         protocols, or best practices that apply to this case.
 
-        Format the response as a professional medical document.
+        IMPORTANT: Format your response exactly as follows:
+        Start with "1. HISTORY OF PRESENT ILLNESS (HPI):" on its own line
+        Then provide the HPI content
+        Then start a new section with "2. ASSESSMENT AND PLAN:" on its own line
+        Then provide the assessment and plan content
         """
         
         response = model.generate_content(prompt)
@@ -220,16 +228,55 @@ def upload_audio():
         else:
             analysis = analyze_with_openai(transcription)
         
+        print("AI RAW RESPONSE:")
+        print(analysis)
+        
         # Parse analysis to separate HPI and Assessment/Plan
-        analysis_parts = analysis.split('\n\n')
         hpi = ""
         assessment_plan = ""
         
-        for part in analysis_parts:
-            if 'HISTORY OF PRESENT ILLNESS' in part.upper() or 'HPI' in part.upper():
-                hpi = part
-            elif 'ASSESSMENT' in part.upper() or 'PLAN' in part.upper():
-                assessment_plan = part
+        # More robust parsing logic
+        lines = analysis.split('\n')
+        current_section = None
+        hpi_lines = []
+        assessment_lines = []
+        
+        for line in lines:
+            line_upper = line.upper().strip()
+            
+            # Detect section headers
+            if any(keyword in line_upper for keyword in ['HISTORY OF PRESENT ILLNESS', 'HPI:', '1. HISTORY']):
+                current_section = 'hpi'
+                hpi_lines.append(line)
+            elif any(keyword in line_upper for keyword in ['ASSESSMENT AND PLAN', 'ASSESSMENT & PLAN', '2. ASSESSMENT', 'PLAN:']):
+                current_section = 'assessment'
+                assessment_lines.append(line)
+            elif line_upper.startswith('2.') and 'ASSESSMENT' in line_upper:
+                current_section = 'assessment'
+                assessment_lines.append(line)
+            elif line_upper.startswith('1.') and 'HISTORY' in line_upper:
+                current_section = 'hpi'
+                hpi_lines.append(line)
+            else:
+                # Add content to current section
+                if current_section == 'hpi' and line.strip():
+                    hpi_lines.append(line)
+                elif current_section == 'assessment' and line.strip():
+                    assessment_lines.append(line)
+        
+        hpi = '\n'.join(hpi_lines) if hpi_lines else ""
+        assessment_plan = '\n'.join(assessment_lines) if assessment_lines else ""
+        
+        # If parsing failed, try alternative approach
+        if not hpi and not assessment_plan:
+            # Try to find sections by looking for numbered lists
+            parts = analysis.split('\n\n')
+            for part in parts:
+                part_upper = part.upper()
+                if any(keyword in part_upper for keyword in ['HISTORY', 'HPI', 'PRESENT ILLNESS']):
+                    hpi = part
+                elif any(keyword in part_upper for keyword in ['ASSESSMENT', 'PLAN', 'DIAGNOSIS', 'TREATMENT']):
+                    assessment_plan = part
         
         # Save to database
         conversation = MedicalConversation(
@@ -365,4 +412,4 @@ def get_conversation(conversation_id):
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5100)

@@ -1,14 +1,15 @@
 import os
 import PyPDF2
 from docx import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.schema import Document as LangchainDocument
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.documents import Document as LangchainDocument
 import chromadb
 from typing import List, Dict, Any
 import hashlib
 import json
+import openai
 
 class DocumentProcessor:
     def __init__(self, knowledge_base_path: str = "knowledge_base"):
@@ -29,6 +30,9 @@ class DocumentProcessor:
             persist_directory=knowledge_base_path,
             embedding_function=self.embeddings
         )
+        
+        # Update OpenAI client
+        client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
     
     def extract_text_from_pdf(self, file_path: str) -> str:
         """Extract text from PDF file"""
@@ -207,4 +211,27 @@ class DocumentProcessor:
             
             return {"success": True, "message": "Knowledge base cleared successfully"}
         except Exception as e:
-            return {"success": False, "error": str(e)} 
+            return {"success": False, "error": str(e)}
+
+def analyze_with_openai(transcription):
+    """Analyze transcription using OpenAI GPT-4 with RAG context"""
+    try:
+        # Get relevant context from knowledge base
+        context = get_relevant_context(transcription)
+        
+        prompt = f"""
+        ... (your prompt as before) ...
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a medical professional assistant. Provide accurate, professional medical analysis using available knowledge base information."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2000,
+            temperature=0.3
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error analyzing with OpenAI: {str(e)}" 
