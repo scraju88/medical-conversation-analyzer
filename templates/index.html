@@ -208,6 +208,12 @@
                                         <h6 class="text-primary"><i class="fas fa-file-alt me-2"></i>Transcription</h6>
                                         <div id="transcriptionContent"></div>
                                     </div>
+                                    <!-- Filled Template Section -->
+                                    <div class="mb-3" id="filledTemplateSection" style="display: none;">
+                                        <label for="filledTemplate" class="form-label">Filled EPIC Template</label>
+                                        <textarea id="filledTemplate" class="form-control" rows="12" readonly></textarea>
+                                        <button class="btn btn-outline-primary mt-2" onclick="copyFilledTemplate()">Copy to Clipboard</button>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -235,6 +241,36 @@
                                                 <div class="spinner-border text-warning" role="status"></div>
                                                 <p class="mt-2">Processing document...</p>
                                             </div>
+                                        </div>
+                                    </div>
+                                    <!-- Template Upload Card -->
+                                    <div class="card mt-4">
+                                        <div class="card-header bg-primary text-white">
+                                            <h5 class="mb-0"><i class="fas fa-file-alt me-2"></i>Upload EPIC Template</h5>
+                                        </div>
+                                        <div class="card-body">
+                                            <form id="templateUploadForm" enctype="multipart/form-data">
+                                                <div class="mb-3">
+                                                    <label for="templateFile" class="form-label">Template File (.txt or .docx)</label>
+                                                    <input type="file" class="form-control" id="templateFile" name="template" accept=".txt,.docx" required>
+                                                </div>
+                                                <div class="mb-3">
+                                                    <label for="templateName" class="form-label">Template Name</label>
+                                                    <input type="text" class="form-control" id="templateName" name="name" placeholder="e.g. ENT Follow-up" required>
+                                                </div>
+                                                <div class="mb-3">
+                                                    <label for="templateMetadata" class="form-label">Metadata (JSON, optional)</label>
+                                                    <textarea class="form-control" id="templateMetadata" name="metadata" placeholder='{"specialty": "ENT"}'></textarea>
+                                                </div>
+                                                <button type="submit" class="btn btn-primary">
+                                                    <i class="fas fa-upload me-2"></i>Upload Template
+                                                </button>
+                                            </form>
+                                            <div class="loading text-center mt-3" id="templateLoading" style="display: none;">
+                                                <div class="spinner-border text-primary" role="status"></div>
+                                                <p class="mt-2">Uploading template...</p>
+                                            </div>
+                                            <div class="result mt-2" id="templateResult"></div>
                                         </div>
                                     </div>
                                 </div>
@@ -409,7 +445,13 @@
             document.getElementById('assessmentContent').innerHTML = formatText(result.assessment_plan);
             document.getElementById('transcriptionContent').innerHTML = formatText(result.transcription);
             document.getElementById('resultsCard').style.display = 'block';
-            
+            // Show filled template if present
+            if (result.filled_template) {
+                document.getElementById('filledTemplateSection').style.display = 'block';
+                document.getElementById('filledTemplate').value = result.filled_template;
+            } else {
+                document.getElementById('filledTemplateSection').style.display = 'none';
+            }
             // Scroll to results
             document.getElementById('resultsCard').scrollIntoView({ behavior: 'smooth' });
         }
@@ -417,6 +459,13 @@
         function formatText(text) {
             if (!text) return '<em>No content available</em>';
             return text.replace(/\n/g, '<br>');
+        }
+
+        function copyFilledTemplate() {
+            const textarea = document.getElementById('filledTemplate');
+            textarea.select();
+            document.execCommand('copy');
+            alert('Template copied to clipboard!');
         }
 
         // Load conversations
@@ -514,7 +563,25 @@
             try {
                 const response = await fetch(`/api/conversations/${conversationId}`);
                 const conversation = await response.json();
-                
+                // Fetch the filled template
+                let filledTemplateHtml = '';
+                try {
+                    const templateResp = await fetch(`/api/conversations/${conversationId}/filled-template`);
+                    if (templateResp.ok) {
+                        const templateData = await templateResp.json();
+                        if (templateData.filled_template) {
+                            filledTemplateHtml = `
+                                <div class="mb-3">
+                                    <label for="modalFilledTemplate" class="form-label">Filled EPIC Template</label>
+                                    <textarea id="modalFilledTemplate" class="form-control" rows="12" readonly>${templateData.filled_template}</textarea>
+                                    <button class="btn btn-outline-primary mt-2" onclick="copyModalFilledTemplate()">Copy to Clipboard</button>
+                                </div>
+                            `;
+                        }
+                    }
+                } catch (err) {
+                    filledTemplateHtml = '';
+                }
                 const modalContent = document.getElementById('modalContent');
                 modalContent.innerHTML = `
                     <div class="row">
@@ -543,14 +610,20 @@
                         <h6 class="text-primary">Transcription</h6>
                         <div>${formatText(conversation.transcription)}</div>
                     </div>
+                    ${filledTemplateHtml}
                 `;
-                
                 new bootstrap.Modal(document.getElementById('conversationModal')).show();
-                
             } catch (error) {
                 console.error('Error loading conversation details:', error);
                 alert('Error loading conversation details');
             }
+        }
+
+        function copyModalFilledTemplate() {
+            const textarea = document.getElementById('modalFilledTemplate');
+            textarea.select();
+            document.execCommand('copy');
+            alert('Template copied to clipboard!');
         }
 
         async function clearKnowledgeBase() {
@@ -592,6 +665,32 @@
                     }
                 });
             });
+        });
+
+        // Add JS for template upload
+        document.getElementById('templateUploadForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const form = e.target;
+            const formData = new FormData(form);
+            document.getElementById('templateLoading').style.display = 'block';
+            document.getElementById('templateResult').textContent = '';
+            try {
+                const response = await fetch('/api/upload-template', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    document.getElementById('templateResult').textContent = 'Success! Template ID: ' + data.template_id;
+                    form.reset();
+                } else {
+                    document.getElementById('templateResult').textContent = 'Error: ' + (data.error || 'Unknown error');
+                }
+            } catch (err) {
+                document.getElementById('templateResult').textContent = 'Error: ' + err.message;
+            } finally {
+                document.getElementById('templateLoading').style.display = 'none';
+            }
         });
     </script>
 </body>

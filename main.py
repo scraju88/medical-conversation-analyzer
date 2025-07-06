@@ -12,8 +12,10 @@ from dotenv import load_dotenv
 import tempfile
 import uuid
 from document_processor import DocumentProcessor
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_chroma import Chroma
+from langchain_core.documents import Document as LangchainDocument
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +35,27 @@ genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 # Initialize document processor
 document_processor = DocumentProcessor()
 
+# Initialize TemplateVectorStore
+class TemplateVectorStore:
+    def __init__(self, persist_directory: str = "template_vectors"):
+        self.persist_directory = persist_directory
+        self.embeddings = OpenAIEmbeddings()
+        self.vectorstore = Chroma(
+            persist_directory=persist_directory,
+            embedding_function=self.embeddings
+        )
+    def add_template(self, template_id: str, content: str, metadata: dict):
+        doc = LangchainDocument(
+            page_content=content,
+            metadata={"template_id": template_id, **metadata}
+        )
+        self.vectorstore.add_documents([doc])
+    def search_templates(self, query: str, top_k: int = 5):
+        docs = self.vectorstore.similarity_search(query, k=top_k)
+        return docs
+
+template_vectorstore = TemplateVectorStore()
+
 # Database Models
 class MedicalConversation(db.Model):
     id = db.Column(db.String(36), primary_key=True)
@@ -43,6 +66,13 @@ class MedicalConversation(db.Model):
     transcription = db.Column(db.Text)
     history_of_present_illness = db.Column(db.Text)
     assessment_plan = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Template(db.Model):
+    id = db.Column(db.String(36), primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    template_metadata = db.Column(db.Text)  # JSON string for tags, specialty, etc.
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 # Create database tables
@@ -188,6 +218,34 @@ def analyze_with_gemini(transcription):
     except Exception as e:
         return f"Error analyzing with Gemini: {str(e)}"
 
+def fill_template_with_llm(template_content, hpi, assessment_plan):
+    prompt = f"""
+    You are a medical documentation assistant. Here is a template for a medical note:
+
+    TEMPLATE:
+    {template_content}
+
+    Here is the patient's History of Present Illness (HPI):
+    {hpi}
+
+    Here is the Assessment and Plan:
+    {assessment_plan}
+
+    Please fill out the template above with the provided HPI and Assessment & Plan in the most appropriate locations, using your best judgment. Return the completed note.
+    """
+    llm = ChatOpenAI(
+        model="gpt-4",
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0.3,
+        max_tokens=2000,
+    )
+    messages = [
+        SystemMessage(content="You are a helpful assistant for medical documentation."),
+        HumanMessage(content=prompt)
+    ]
+    response = llm.invoke(messages)
+    return response.content
+
 @app.route('/')
 def index():
     """Serve the web interface"""
@@ -278,6 +336,16 @@ def upload_audio():
                 elif any(keyword in part_upper for keyword in ['ASSESSMENT', 'PLAN', 'DIAGNOSIS', 'TREATMENT']):
                     assessment_plan = part
         
+        # Find and fill the best template
+        filled_template = None
+        best_template = find_best_template(hpi, assessment_plan)
+        if best_template:
+            filled_template = fill_template_with_llm(
+                best_template.content,
+                hpi,
+                assessment_plan
+            )
+        
         # Save to database
         conversation = MedicalConversation(
             id=conversation_id,
@@ -297,6 +365,7 @@ def upload_audio():
             'transcription': transcription,
             'history_of_present_illness': hpi,
             'assessment_plan': assessment_plan,
+            'filled_template': filled_template,
             'message': 'Audio processed successfully'
         })
         
@@ -346,6 +415,46 @@ def upload_document():
         else:
             return jsonify({'error': result['error']}), 500
         
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/upload-template', methods=['POST'])
+def upload_template():
+    """Upload and store an EPIC template (TXT or DOCX) with optional metadata."""
+    try:
+        if 'template' not in request.files:
+            return jsonify({'error': 'No template file provided'}), 400
+        template_file = request.files['template']
+        name = request.form.get('name', template_file.filename)
+        metadata = request.form.get('metadata', '{}')  # JSON string
+        # Read file content
+        filename = template_file.filename.lower()
+        if filename.endswith('.txt'):
+            content = template_file.read().decode('utf-8')
+        elif filename.endswith('.docx'):
+            from docx import Document
+            import io
+            doc = Document(io.BytesIO(template_file.read()))
+            content = '\n'.join([para.text for para in doc.paragraphs])
+        else:
+            return jsonify({'error': 'Unsupported file type. Supported: TXT, DOCX'}), 400
+        # Store in DB
+        template_id = str(uuid.uuid4())
+        template = Template(
+            id=template_id,
+            name=name,
+            content=content,
+            template_metadata=metadata
+        )
+        db.session.add(template)
+        db.session.commit()
+        # Add to vector store
+        try:
+            meta_dict = json.loads(metadata) if metadata else {}
+        except Exception:
+            meta_dict = {}
+        template_vectorstore.add_template(template_id, content, meta_dict)
+        return jsonify({'message': 'Template uploaded successfully', 'template_id': template.id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -410,6 +519,76 @@ def get_conversation(conversation_id):
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/conversations/<conversation_id>/filled-template', methods=['GET'])
+def get_filled_template(conversation_id):
+    """Return the best-matched filled template for a conversation."""
+    try:
+        conversation = MedicalConversation.query.get(conversation_id)
+        if not conversation:
+            return jsonify({'error': 'Conversation not found'}), 404
+        best_template = find_best_template(conversation.history_of_present_illness, conversation.assessment_plan)
+        if not best_template:
+            return jsonify({'error': 'No suitable template found'}), 404
+        filled_template = fill_template_with_llm(
+            best_template.content,
+            conversation.history_of_present_illness or '',
+            conversation.assessment_plan or ''
+        )
+        return jsonify({'filled_template': filled_template, 'template_id': best_template.id, 'template_name': best_template.name})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def find_best_template(hpi, assessment_plan, top_k=3):
+    """Hybrid: Use vector search for top N, then LLM to select the best template."""
+    try:
+        query_text = (hpi or '') + ' ' + (assessment_plan or '')
+        # Step 1: Vector search for top N
+        candidates = template_vectorstore.search_templates(query_text, top_k=top_k)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            # Only one candidate, return it
+            template_id = candidates[0].metadata.get('template_id')
+            return Template.query.get(template_id)
+        # Step 2: LLM selection
+        # Prepare prompt
+        prompt = f"""
+        Given the following conversation summary and template options, select the best template for this case. 
+        Conversation summary:
+        HPI: {hpi}
+        Assessment & Plan: {assessment_plan}
+
+        Template options:
+        """
+        for i, doc in enumerate(candidates):
+            template_id = doc.metadata.get('template_id')
+            template = Template.query.get(template_id)
+            prompt += f"Option {i+1} (ID: {template_id}, Name: {template.name}):\n{template.content}\n\n"
+        prompt += "\nRespond ONLY with the ID of the best template option."
+        llm = ChatOpenAI(
+            model="gpt-4",
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            temperature=0.0,
+            max_tokens=20,
+        )
+        messages = [
+            SystemMessage(content="You are a helpful assistant for template selection."),
+            HumanMessage(content=prompt)
+        ]
+        response = llm.invoke(messages)
+        selected_id = response.content.strip()
+        # Try to extract a valid template ID from the response
+        for doc in candidates:
+            template_id = doc.metadata.get('template_id')
+            if template_id in selected_id:
+                return Template.query.get(template_id)
+        # Fallback: return top candidate
+        template_id = candidates[0].metadata.get('template_id')
+        return Template.query.get(template_id)
+    except Exception as e:
+        print(f"Error in hybrid template matching: {e}")
+        return None
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5100)
